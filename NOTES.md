@@ -122,9 +122,95 @@ of this one refresh.
 | `STALE_LAG_LN`, `STALE_VAR` | 1.20, 0.80 | a page that never rescanned lags the launch curve by ~e^1.2 in `ln T`; chosen against the documented 638 -> 3,868 refresh |
 | `SHIFT_MAX` | 2.20 | cap on how far a median may move from the last reading, in logits |
 | `CV_VAR` | 0.02 | variance of the tracked-count projection passed through the slope |
-| `SPREAD_SCALE/FLOOR/MAX` | 1.05 / 0.30 / 2.60 | tail misses cost ~20x a wide band, so widen a little and never go below 0.30 |
+| `SPREAD_SCALE/FLOOR/MAX` | 0.50 / 0.26 / 2.60 | the naive `1/E` variance overstates the error (the target snapshot *contains* the observed players, so their counting noise is common mode); 0.50 with a 0.26 floor was the plateau on held-out seeds and cut both practice cases by ~45 % |
+| `DRIFT_LOW`, `DRIFT_HIGH` | 1.00, 2.80 | long-horizon drift per `ln(1+h)` at the two tails, see the drift section below |
 | `MAX_WEIGHT` | 120 | caps the influence of one very common trophy |
-| write rounding | 4 dp | ~2.8 kB per case against a 65,536-byte budget |
+| write rounding | 4 dp | ~3.0 kB per case against a 65,536-byte budget |
 
 `Z = [-1.6449, -0.6745, 0, 0.6745, 1.6449]` for the 5 / 25 / 50 / 75 / 95 %
 quantiles.
+
+## Tuning round: the long-horizon level drift
+
+The final case runs 4.52 d past a 60 h history, and the shipped model was
+systematically low at both tails over that horizon while being spot on in the
+middle. Per last-rate bucket, truth vs model logit movement over the horizon
+(24 held-out synthetic finals, seeds disjoint from the ones tuned on):
+
+| last rate | n | truth moves | model moved | cov90 |
+| --- | --- | --- | --- | --- |
+| 1-2 % | 60 | +1.13 | +0.31 | 0.52 |
+| 2-5 % | 177 | +0.87 | +0.39 | - |
+| 5-10 % | 213 | +0.67 | +0.40 | - |
+| 10-25 % | 311 | +0.50 | +0.40 | - |
+| 25-50 % | 244 | +0.40 | +0.41 | - |
+| 50-80 % | 179 | +0.45 | +0.43 | - |
+| 80-101 % | 136 | +1.21 | +0.44 | 0.68 |
+
+The cause is the link, not the slope: a share that climbs by a fixed number of
+points moves `dp / p(1-p)` in logits, so a 1.7 % trophy gaining 2.8 points
+travels +0.7 and a 93.8 % one gaining 5.4 points travels +1.6, while a 40 %
+trophy gains its 9 points in the cheapest part of the scale. The dilution slope
+in `ln T` cannot express that -- over the final horizon `du` is only ~0.2 while
+`dv = d ln(1+h)` is ~1.0 -- so the fit is right about the *direction* of every
+trophy and wrong about the tails' *distance*.
+
+`levelDrift(p)` adds `dv * (DRIFT_LOW*w_lo^2 + DRIFT_HIGH*w_hi^2)` to the
+median, with `w_lo = clamp(-logit(p)/5)` (1 at 0.7 %, 0 at 50 %) and
+`w_hi = clamp((logit(p) - 1.1)/2.2)` (0 at 25 %, 1 from 93 % up). Fitted on
+tune-seed finals, checked on the disjoint valid-seed finals, which reproduce it.
+
+It is switched off when the history holds a single rescan (`driftOn`): with one
+frozen snapshot the pending refresh dominates the horizon and the earners'
+growth cannot be separated from the denominator's -- the same reason
+`fitTracked` falls back to its stale prior there. Both practice cases are that
+shape, so they are untouched by the drift and keep their documented losses.
+
+### Numbers (mean pinball loss in logit space)
+
+| set | before | after |
+| --- | --- | --- |
+| `sim/sim.mjs 40`, final-shaped | 0.2033 | 0.0736 |
+| `sim/sim.mjs 40`, launch-shaped | 0.5401 | 0.5490 |
+| practice p00 / p01 | 0.2267 / 0.2337 | 0.1254 / 0.1330 |
+| tune seeds, 24 finals | 0.2079 | 0.0735 |
+| held-out seeds, 24 finals | 0.2091 | 0.0716 |
+
+Coverage on the held-out finals went 0.944 -> 0.992 and the mean tail miss
+2.0 -> 0.65 points. Launch-shaped cases give up 1.6 %: their truth rises 0.8
+logits in 90 minutes at hour 3, which no constant of this model can express, and
+the tighter band stops hedging it. Both real practice cases improved, so the
+trade was taken.
+
+### Constant scans (final-shaped, tune seeds; the same shape on held-out seeds)
+
+| constant | range tried | best | note |
+| --- | --- | --- | --- |
+| `SLOPE_DAMP` | 0.40-0.95 | 0.80 | flat optimum, 0.0874 at 0.90 |
+| `SLOPE_SD` | 0.12-0.60 | 0.30-0.38 | 0.0728 at 0.38, within noise, left at 0.30 |
+| `SHIFT_MAX` | 1.2-3.0 | 2.20 | 1.2 costs the practice cases 0.034 |
+| `C_PRIOR`, `C_PRIOR_W` | 0-0.30, 10-90 | 0.06, 40 | flat to 4 dp |
+| `TRACK_P_*` | 0.7-1.3, 0.8-1.0, 1.2-2.2 | unchanged | practice is sensitive to these, finals are not |
+| `STALE_LAG_LN`, `STALE_VAR` | 0.8-1.6, 0.4-1.3 | unchanged | practice would take 1.6 / 0.4, but that is three parameters fitted to two correlated cases |
+| `DRIFT_LOW` x `DRIFT_HIGH` | 0-2.2 x 0-5.2 | 1.00, 2.80 | interior minimum on both seed sets |
+| `SPREAD_SCALE` x `SPREAD_FLOOR` | 0.3-1.2 x 0.18-0.38 | 0.50, 0.26 | see below |
+
+### Tried and dropped
+
+- **Heteroscedastic spread from the trophy's own fit scatter.** Adding
+  `MODEL_VAR * residVar` to the variance widened the badly-located launch cases
+  by only 6 % (their error is a bias, not scatter) while costing the finals 10 %
+  (`MODEL_VAR` 0 -> 2 costs 0.078 -> 0.087 at `SPREAD_SCALE` 0.45). Dropped.
+- **Stripping the level drift out of the fitted slope** so `b` would measure
+  dilution alone. The slope then has nothing to fit against `ln T` and the loss
+  explodes to 0.61 (coverage 0.02). The shipped decomposition, where `b` absorbs
+  the observed trend and the drift is added forward, is the one that works.
+- **Tuning the stale-page constants on the practice cases** (`TRACK_P_PRIOR`
+  1.3, `STALE_LAG_LN` 1.6, `STALE_VAR` 0.4 take practice to ~0.105) -- two cases
+  behind one and the same refresh event cannot identify three parameters, and
+  the final case's page rescans often, so the stale path should not fire there.
+
+### Runtime
+
+39 ms per 121-read, 55-trophy case including node startup (`sim/time.mjs`), and
+about 3.0 kB of output per case.

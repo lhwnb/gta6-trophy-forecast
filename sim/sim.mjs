@@ -8,7 +8,11 @@
 // every rare rate cut several-fold) without hand-fitting it.
 //
 // Run: node sim/sim.mjs [cases]
+//
+// Imported by sim/tune.mjs for the world generator only, so the bake-off below
+// runs only when this file is executed directly.
 
+import { pathToFileURL } from 'node:url';
 import { forecastCase } from '../main.ts';
 
 const LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95];
@@ -217,50 +221,56 @@ function timeTrend(c, cap = 1.0) {
 export { makeWorld, makeCase, score, houseBaseline, timeTrend, logit };
 
 // -- bake-off -----------------------------------------------------------------
-const nCases = Number(process.argv[2] ?? 24);
-const rows = [];
-for (let k = 0; k < nCases; k++) {
-  const world = makeWorld(1000 + k * 7);
-  const atH = 48 + (k % 6) * 4;          // 48-68 h history
-  const targetH = atH + 6510 / 60;        // the final's 4.52 day horizon
-  const { caseObj, truth } = makeCase(world, 500 + k, { atH, targetH, id: `f${k}` });
-  const models = {
-    house: houseBaseline(caseObj),
-    trend: timeTrend(caseObj),
-    mine: forecastCase(caseObj),
-  };
-  for (const [name, r] of Object.entries(models)) {
-    const s = score(caseObj, r, truth);
-    rows.push({ name, ...s });
-  }
-}
-const by = {};
-for (const r of rows) {
-  by[r.name] ??= { loss: 0, miss: 0, cov: 0, n: 0 };
-  by[r.name].loss += r.loss; by[r.name].miss += r.miss; by[r.name].cov += r.coverage; by[r.name].n++;
-}
-console.log(`\n=== final-shaped cases (${nCases}, horizon ${(6510 / 60).toFixed(2)} d) ===`);
-console.log('model    loss     miss    cov90');
-for (const [name, v] of Object.entries(by)) {
-  console.log(`${name.padEnd(8)} ${(v.loss / v.n).toFixed(4)}  ${(v.miss / v.n).toFixed(3)}  ${(v.cov / v.n).toFixed(3)}`);
-}
+const isMain = (() => {
+  try { return !!process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href; } catch { return false; }
+})();
 
-// practice-shaped: 90 minute horizon across a refresh the history cannot see
-const prows = [];
-for (let k = 0; k < 12; k++) {
-  const world = makeWorld(3000 + k * 13, { prereg: 640 });
-  const { caseObj, truth } = makeCase(world, 700 + k, { atH: 3 + 0.5 * (k % 2), targetH: 4.5 + 0.5 * (k % 2), id: `p${k}` });
-  for (const [name, r] of Object.entries({ house: houseBaseline(caseObj), trend: timeTrend(caseObj), mine: forecastCase(caseObj) })) {
-    prows.push({ name, ...score(caseObj, r, truth) });
+if (isMain) {
+  const nCases = Number(process.argv[2] ?? 24);
+  const rows = [];
+  for (let k = 0; k < nCases; k++) {
+    const world = makeWorld(1000 + k * 7);
+    const atH = 48 + (k % 6) * 4;          // 48-68 h history
+    const targetH = atH + 6510 / 60;        // the final's 4.52 day horizon
+    const { caseObj, truth } = makeCase(world, 500 + k, { atH, targetH, id: `f${k}` });
+    const models = {
+      house: houseBaseline(caseObj),
+      trend: timeTrend(caseObj),
+      mine: forecastCase(caseObj),
+    };
+    for (const [name, r] of Object.entries(models)) {
+      const s = score(caseObj, r, truth);
+      rows.push({ name, ...s });
+    }
   }
-}
-const pby = {};
-for (const r of prows) {
-  pby[r.name] ??= { loss: 0, miss: 0, cov: 0, n: 0 };
-  pby[r.name].loss += r.loss; pby[r.name].miss += r.miss; pby[r.name].cov += r.coverage; pby[r.name].n++;
-}
-console.log('\n=== launch-night practice-shaped cases (90 min, across a refresh) ===');
-console.log('model    loss     miss    cov90');
-for (const [name, v] of Object.entries(pby)) {
-  console.log(`${name.padEnd(8)} ${(v.loss / v.n).toFixed(4)}  ${(v.miss / v.n).toFixed(3)}  ${(v.cov / v.n).toFixed(3)}`);
+  const by = {};
+  for (const r of rows) {
+    by[r.name] ??= { loss: 0, miss: 0, cov: 0, n: 0 };
+    by[r.name].loss += r.loss; by[r.name].miss += r.miss; by[r.name].cov += r.coverage; by[r.name].n++;
+  }
+  console.log(`\n=== final-shaped cases (${nCases}, horizon ${(6510 / 60).toFixed(2)} h) ===`);
+  console.log('model    loss     miss    cov90');
+  for (const [name, v] of Object.entries(by)) {
+    console.log(`${name.padEnd(8)} ${(v.loss / v.n).toFixed(4)}  ${(v.miss / v.n).toFixed(3)}  ${(v.cov / v.n).toFixed(3)}`);
+  }
+
+  // practice-shaped: 90 minute horizon across a refresh the history cannot see
+  const prows = [];
+  for (let k = 0; k < 12; k++) {
+    const world = makeWorld(3000 + k * 13, { prereg: 640 });
+    const { caseObj, truth } = makeCase(world, 700 + k, { atH: 3 + 0.5 * (k % 2), targetH: 4.5 + 0.5 * (k % 2), id: `p${k}` });
+    for (const [name, r] of Object.entries({ house: houseBaseline(caseObj), trend: timeTrend(caseObj), mine: forecastCase(caseObj) })) {
+      prows.push({ name, ...score(caseObj, r, truth) });
+    }
+  }
+  const pby = {};
+  for (const r of prows) {
+    pby[r.name] ??= { loss: 0, miss: 0, cov: 0, n: 0 };
+    pby[r.name].loss += r.loss; pby[r.name].miss += r.miss; pby[r.name].cov += r.coverage; pby[r.name].n++;
+  }
+  console.log('\n=== launch-night practice-shaped cases (90 min, across a refresh) ===');
+  console.log('model    loss     miss    cov90');
+  for (const [name, v] of Object.entries(pby)) {
+    console.log(`${name.padEnd(8)} ${(v.loss / v.n).toFixed(4)}  ${(v.miss / v.n).toFixed(3)}  ${(v.cov / v.n).toFixed(3)}`);
+  }
 }

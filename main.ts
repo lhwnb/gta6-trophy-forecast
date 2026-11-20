@@ -63,12 +63,21 @@ const TRACK_P_MAX = 1.60;
 const TRACK_P_DAMP = 0.95;
 const STALE_LAG_LN = 1.20;  // a page that never moved is behind, not current
 const STALE_VAR = 0.80;
-const SPREAD_SCALE = 1.05;
-const SPREAD_FLOOR = 0.30;
+const SPREAD_SCALE = 0.50;   // the naive 1/E variance overstates: the target
+                            // snapshot contains the observed players, so their
+                            // counting noise is common mode and does not double
+const SPREAD_FLOOR = 0.26;   // 90 % band never narrower than +-0.43 logits
 const SPREAD_MAX = 2.60;
 const MAX_WEIGHT = 120;     // cap on one rescan's leverage in the fit
 const SHIFT_MAX = 2.20;     // no median moves further than this on the logit
 const CV_VAR = 0.02;        // prior variance on the shared drift
+// Long-horizon drift, per ln-hour: over days a trophy's share keeps climbing,
+// and its logit climb is U-shaped in the level -- a 1 % trophy and a 95 % one
+// both travel further than a 40 % one, because the share moves in percentage
+// points while the score is in logits (dp/p(1-p)). Fitted on held-out synthetic
+// seeds, where the fitted dilution slope alone left the tails 0.5-1.6 logits low.
+const DRIFT_LOW = 1.00;     // weight of the rare tail, at the 0.7 % end
+const DRIFT_HIGH = 2.80;    // weight of the saturated tail, at the 94 % end
 
 const clamp = (x: number, lo: number, hi: number): number => (x < lo ? lo : x > hi ? hi : x);
 const clampPct = (x: number): number => clamp(x, 0.01, 99.99);
@@ -114,6 +123,21 @@ function tierTilt(tier: string | undefined): number {
   if (tier === 'gold') return 0.0;
   if (tier === 'silver') return 0.03;
   return 0.05;
+}
+
+/**
+ * Long-horizon drift on the logit scale, as a function of where the trophy sits.
+ * The share keeps climbing after the deadline: new players arrive and start
+ * earning, and in percentage points that climb is roughly the same everywhere,
+ * but the score is a logit, so dp/p(1-p) makes the two tails travel furthest --
+ * a 1 % trophy still has 99 % of its audience to gain, a 94 % one has the last
+ * few percent arriving, while a 40 % one moves least per point of share.
+ */
+function levelDrift(ratePct: number): number {
+  const m = logit(ratePct);
+  const lo = clamp(-m / 5, 0, 1);              // 1 at 0.7 %, 0 at 50 %
+  const hi = clamp((m - 1.1) / 2.2, 0, 1);     // 0 at 25 %, 1 from 93 % up
+  return DRIFT_LOW * lo * lo + DRIFT_HIGH * hi * hi;
 }
 
 /** How many tracked players a trophy's rate implies. */
@@ -203,6 +227,11 @@ export function forecastCase(c: CaseFile): Array<{ id: number; q: number[] }> {
   const tracked = fitTracked(epochs, targetV);
   const uTarget = Math.max(tracked.u, lastRead.u);
   const TTarget = Math.exp(uTarget);
+  // The level drift below needs a history that actually moved: with a single
+  // frozen snapshot the pending refresh dominates the horizon and the earners'
+  // growth cannot be separated from the denominator's, so the fitted slope alone
+  // carries the case (same reason fitTracked falls back to its stale prior).
+  const driftOn = epochs.length >= 2;
 
   const p = (rate: number): number => clampPct(rate) / 100;
   const toRow = (rate: number, r: Read): Row => ({
@@ -273,7 +302,7 @@ export function forecastCase(c: CaseFile): Array<{ id: number; q: number[] }> {
     // rate was still climbing out of. Carry only the fitted increments forward.
     const du = uTarget - lastRead.u;
     const dv = targetV - lastRead.v;
-    const mRaw = logit(baseRate) + b * du + cDrift * dv;
+    const mRaw = logit(baseRate) + b * du + cDrift * dv + (driftOn ? levelDrift(baseRate) * dv : 0);
     const m = logit(baseRate) + clamp(mRaw - logit(baseRate), -SHIFT_MAX, SHIFT_MAX);
     const rateAt = clampPct(expit(m));
 
